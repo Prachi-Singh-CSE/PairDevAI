@@ -66,7 +66,11 @@ export default function Traces({ runs, activeRunId }) {
               <div className="h-full bg-cyan-400" style={{ width: `${detail.progress}%` }} />
             </div>
           ) : null}
-          <TraceViewer traces={detail.traces} evaluations={detail.evaluations} />
+          <TraceViewer
+            traces={detail.traces}
+            evaluations={detail.evaluations}
+            testCases={detail.test_cases || []}
+          />
         </div>
       ) : (
         <p className="text-slate-500">Select a run to inspect traces.</p>

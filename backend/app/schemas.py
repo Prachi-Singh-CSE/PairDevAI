@@ -89,7 +89,7 @@ class RunOut(ORMModel):
 class RunDetailOut(RunOut):
     traces: list[TraceEventOut] = Field(default_factory=list)
     evaluations: list[EvaluationOut] = Field(default_factory=list)
-
+    test_cases: list[TestCaseOut] = Field(default_factory=list)
 
 class RunCreate(BaseModel):
     version_id: int
@@ -118,6 +118,12 @@ class OverviewOut(BaseModel):
     tool_calls_per_task: float
     estimated_cost_usd: float
     tinyfish_events: int
+
+    # Results of the latest completed test run
+    latest_test_total: int = 0
+    latest_test_passed: int = 0
+    latest_test_failed: int = 0
+
     latest_runs: list[RunOut]
     taxonomy_counts: dict[str, int]
     version_stats: list[dict[str, Any]]

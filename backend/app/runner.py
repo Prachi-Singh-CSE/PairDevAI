@@ -45,24 +45,21 @@ def execute_run(db: Session, run_id: int) -> Run:
 
         persisted_events: list[dict[str, Any]] = []
         for event in execution["events"]:
+            # Save the final agent output for user-friendly response comparison
             step += 1
-            row = TraceEvent(
-                run_id=run.id,
-                test_case_id=case.id,
-                step=step,
-                event_type=event["event_type"],
-                payload=event.get("payload") or {},
-                duration_ms=float(event.get("duration_ms") or 0),
-                status=event.get("status") or "ok",
-            )
-            db.add(row)
-            persisted_events.append(
-                {
-                    "event_type": row.event_type,
-                    "payload": row.payload,
-                    "status": row.status,
-                    "duration_ms": row.duration_ms,
-                }
+
+            final_output = execution.get("output") or {}
+
+            db.add(
+                TraceEvent(
+                    run_id=run.id,
+                    test_case_id=case.id,
+                    step=step,
+                    event_type="agent.final",
+                    payload={"output": final_output},
+                    duration_ms=0.0,
+                    status="ok" if final_output.get("ok", True) else "error",
+                )
             )
 
         reference_text = ""

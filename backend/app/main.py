@@ -135,6 +135,37 @@ def overview(db: Session = Depends(get_db)) -> OverviewOut:
             }
         )
     latest = sorted(runs, key=lambda r: r.created_at, reverse=True)[:8]
+
+    # Calculate test results from the latest completed run
+    latest_completed = (
+        db.query(Run)
+        .options(joinedload(Run.evaluations))
+        .filter(Run.status == "completed")
+        .order_by(Run.created_at.desc())
+        .first()
+    )
+
+    test_results = {}
+
+    if latest_completed:
+        for evaluation in latest_completed.evaluations:
+            case_id = evaluation.test_case_id
+
+            if case_id not in test_results:
+                test_results[case_id] = True
+
+            if not evaluation.passed:
+                test_results[case_id] = False
+
+    latest_test_total = len(test_results)
+    latest_test_passed = sum(test_results.values())
+    latest_test_failed = latest_test_total - latest_test_passed
+
+
+
+
+
+
     return OverviewOut(
         project=ProjectOut.model_validate(project),
         total_runs=len(runs),
@@ -144,6 +175,9 @@ def overview(db: Session = Depends(get_db)) -> OverviewOut:
         tool_calls_per_task=round(sum(tool_rates) / max(len(tool_rates), 1), 2),
         estimated_cost_usd=round(sum(r.cost_usd for r in completed), 4),
         tinyfish_events=int(tinyfish_events),
+        latest_test_total=latest_test_total,
+        latest_test_passed=latest_test_passed,
+        latest_test_failed=latest_test_failed,
         latest_runs=[_run_out(r) for r in latest],
         taxonomy_counts={name: int(count) for name, count in taxonomy_rows},
         version_stats=version_stats,
@@ -226,7 +260,7 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetailOut:
         db.query(Run)
         .options(
             joinedload(Run.version),
-            joinedload(Run.suite),
+            joinedload(Run.suite).joinedload(TestSuite.cases),
             joinedload(Run.traces),
             joinedload(Run.evaluations),
         )
@@ -240,6 +274,7 @@ def get_run(run_id: int, db: Session = Depends(get_db)) -> RunDetailOut:
         **base.model_dump(),
         traces=sorted(run.traces, key=lambda item: item.step),
         evaluations=run.evaluations,
+        test_cases=run.suite.cases if run.suite else [],
     )
 
 
@@ -248,18 +283,39 @@ def list_comparisons(db: Session = Depends(get_db)) -> list[Comparison]:
     return db.query(Comparison).order_by(Comparison.id.desc()).all()
 
 
+
 @app.post("/api/comparisons", response_model=ComparisonOut)
-def create_comparison(payload: ComparisonCreate, db: Session = Depends(get_db)) -> Comparison:
+def create_comparison(
+    payload: ComparisonCreate,
+    db: Session = Depends(get_db),
+) -> Comparison:
+
     baseline = db.get(Run, payload.baseline_run_id)
     candidate = db.get(Run, payload.candidate_run_id)
+
     if not baseline or not candidate:
         raise HTTPException(404, "Runs not found")
+
+    if baseline.status != "completed" or candidate.status != "completed":
+        raise HTTPException(
+            400,
+            "Both runs must be completed before comparison."
+        )
+
+    if baseline.suite_id != candidate.suite_id:
+        raise HTTPException(
+            400,
+            "Select runs from the same test suite for regression comparison."
+        )
+
     row = Comparison(
         baseline_run_id=baseline.id,
         candidate_run_id=candidate.id,
         delta_metrics=_delta(baseline, candidate),
     )
+
     db.add(row)
     db.commit()
     db.refresh(row)
+
     return row

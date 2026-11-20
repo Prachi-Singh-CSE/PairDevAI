@@ -1,10 +1,14 @@
+
 from __future__ import annotations
+
+from collections import Counter
 
 from sqlalchemy.orm import Session
 
 from app.adapters.tinyfish import TinyFishAdapter
 from app.models import AgentVersion, Comparison, Project, Run, TestCase, TestSuite
 from app.runner import execute_run
+
 
 REFUND_POLICY_MD = """# Acme Support Refund Policy
 
@@ -31,15 +35,18 @@ same navigation repeats without progress.
 def seed_if_empty(db: Session) -> None:
     if db.query(Project).first():
         return
+
     seed(db)
 
 
 def seed(db: Session, with_runs: bool = True) -> None:
     adapter = TinyFishAdapter()
+
     fetch = adapter.fetch_pages(
         ["https://example.com"],
         purpose="Seed TinyFish Fetch grounding corpus for AgentOps evaluation",
     )
+
     search = adapter.search("example.com refund policy 30 days")
 
     project = Project(name="AgentOps Reliability Lab")
@@ -52,12 +59,14 @@ def seed(db: Session, with_runs: bool = True) -> None:
         model_label="gpt-4.1-mini",
         system_prompt=BASELINE_PROMPT,
     )
+
     candidate = AgentVersion(
         project_id=project.id,
         name="Candidate",
         model_label="gpt-4.1",
         system_prompt=CANDIDATE_PROMPT,
     )
+
     db.add_all([baseline, candidate])
 
     support = TestSuite(
@@ -65,11 +74,13 @@ def seed(db: Session, with_runs: bool = True) -> None:
         name="Customer Support Refunds",
         description="Policy-safe refund handling with tool-call assertions.",
     )
+
     web = TestSuite(
         project_id=project.id,
         name="TinyFish Web Agent",
         description="Live TinyFish Agent SSE, Fetch grounding, and loop detection.",
     )
+
     db.add_all([support, web])
     db.flush()
 
@@ -183,7 +194,9 @@ def seed(db: Session, with_runs: bool = True) -> None:
                 "grounding_terms": ["example"],
                 "output_schema": {
                     "type": "object",
-                    "properties": {"title": {"type": "string"}},
+                    "properties": {
+                        "title": {"type": "string"}
+                    },
                     "required": ["title"],
                 },
                 "max_latency_ms": 90000,
@@ -231,6 +244,7 @@ def seed(db: Session, with_runs: bool = True) -> None:
             },
         ),
     ]
+
     db.add_all(cases)
     db.commit()
 
@@ -239,15 +253,29 @@ def seed(db: Session, with_runs: bool = True) -> None:
 
     baseline_runs = []
     candidate_runs = []
+
     for suite in (support, web):
-        b_run = Run(version_id=baseline.id, suite_id=suite.id, status="queued")
-        c_run = Run(version_id=candidate.id, suite_id=suite.id, status="queued")
+        b_run = Run(
+            version_id=baseline.id,
+            suite_id=suite.id,
+            status="queued",
+        )
+
+        c_run = Run(
+            version_id=candidate.id,
+            suite_id=suite.id,
+            status="queued",
+        )
+
         db.add_all([b_run, c_run])
         db.commit()
+
         execute_run(db, b_run.id)
         execute_run(db, c_run.id)
+
         db.refresh(b_run)
         db.refresh(c_run)
+
         baseline_runs.append(b_run)
         candidate_runs.append(c_run)
 
@@ -259,28 +287,168 @@ def seed(db: Session, with_runs: bool = True) -> None:
                 delta_metrics=_delta(b_run, c_run),
             )
         )
+
     db.commit()
 
 
+# --------------------------------------------------
+# STAGE 3: RETRY COUNT ESTIMATION
+# --------------------------------------------------
+
+def _retry_count(run: Run) -> int:
+    """
+    Estimate retry count from persisted trace events.
+
+    This is an estimate based on available event information.
+    It is not guaranteed to represent every actual retry.
+    """
+
+    retry_events = 0
+    repeated_actions = Counter()
+
+    for event in run.traces:
+        event_type = str(event.event_type or "").lower()
+        payload = event.payload or {}
+
+        # Count events explicitly marked as retries.
+        if event_type.endswith("retry") or payload.get("retry"):
+            retry_events += 1
+
+        # Track repeated tool/navigation actions.
+        if event_type.startswith("tool.") or event_type == "tinyfish.progress":
+            action = (
+                payload.get("action")
+                or payload.get("purpose")
+                or event_type
+            )
+
+            repeated_actions[str(action)] += 1
+
+    # Repeated actions beyond their first occurrence.
+    repeated_calls = sum(
+        max(0, count - 1)
+        for count in repeated_actions.values()
+    )
+
+    return retry_events + repeated_calls
+
+
+# --------------------------------------------------
+# STAGE 3: TEST CASE RESULT EXTRACTION
+# --------------------------------------------------
+
+def _case_results(run: Run) -> dict[int, bool]:
+    """
+    Return test case results in the form:
+    {
+        test_case_id: True or False
+    }
+
+    If a test case has multiple evaluation records,
+    it is considered passed only when all records pass.
+    """
+
+    results = {}
+
+    for evaluation in run.evaluations:
+        case_id = evaluation.test_case_id
+
+        if case_id not in results:
+            results[case_id] = True
+
+        if not evaluation.passed:
+            results[case_id] = False
+
+    return results
+
+
+# --------------------------------------------------
+# STAGE 3: COMPARISON METRICS
+# --------------------------------------------------
+
 def _delta(baseline: Run, candidate: Run) -> dict:
+    """
+    Compare baseline and candidate runs.
+
+    Includes:
+    - Pass rate difference
+    - Latency difference
+    - Tool call difference
+    - Cost difference
+    - Estimated retry difference
+    - Regression count
+    - Improvement count
+    - Individual regressed/improved test case IDs
+    """
+
+    baseline_cases = _case_results(baseline)
+    candidate_cases = _case_results(candidate)
+
+    # A regression occurs when a previously passing test case fails.
+    regressions = [
+        case_id
+        for case_id, passed in baseline_cases.items()
+        if passed and candidate_cases.get(case_id) is False
+    ]
+
+    # An improvement occurs when a previously failing test case passes.
+    improvements = [
+        case_id
+        for case_id, passed in baseline_cases.items()
+        if not passed and candidate_cases.get(case_id) is True
+    ]
+
+    baseline_retries = _retry_count(baseline)
+    candidate_retries = _retry_count(candidate)
+
     return {
-        "pass_rate_delta": round(candidate.pass_rate - baseline.pass_rate, 4),
-        "latency_delta_ms": round(candidate.latency_ms - baseline.latency_ms, 2),
-        "tool_call_delta": candidate.tool_call_count - baseline.tool_call_count,
-        "cost_delta_usd": round(candidate.cost_usd - baseline.cost_usd, 4),
+        "pass_rate_delta": round(
+            candidate.pass_rate - baseline.pass_rate,
+            4,
+        ),
+
+        "latency_delta_ms": round(
+            candidate.latency_ms - baseline.latency_ms,
+            2,
+        ),
+
+        "tool_call_delta": (
+            candidate.tool_call_count - baseline.tool_call_count
+        ),
+
+        "cost_delta_usd": round(
+            candidate.cost_usd - baseline.cost_usd,
+            4,
+        ),
+
+        "retry_delta": (
+            candidate_retries - baseline_retries
+        ),
+
+        "regression_count": len(regressions),
+
+        "improvement_count": len(improvements),
+
+        "regression_case_ids": regressions,
+
+        "improved_case_ids": improvements,
+
         "baseline": {
             "id": baseline.id,
             "pass_rate": baseline.pass_rate,
             "latency_ms": baseline.latency_ms,
             "tool_call_count": baseline.tool_call_count,
             "cost_usd": baseline.cost_usd,
+            "retry_count": baseline_retries,
         },
+
         "candidate": {
             "id": candidate.id,
             "pass_rate": candidate.pass_rate,
             "latency_ms": candidate.latency_ms,
             "tool_call_count": candidate.tool_call_count,
             "cost_usd": candidate.cost_usd,
+            "retry_count": candidate_retries,
         },
     }
 
@@ -289,9 +457,12 @@ if __name__ == "__main__":
     from app.database import SessionLocal, init_db
 
     init_db()
+
     session = SessionLocal()
+
     try:
         seed_if_empty(session)
         print("Seed complete.")
+
     finally:
         session.close()
